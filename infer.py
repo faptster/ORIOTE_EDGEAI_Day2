@@ -1,465 +1,380 @@
-"""Segment coffee beans with the Day 2 YOLO-seg ONNX model on a Raspberry Pi 4 CPU.
+"""CPU-only NCNN inference without PyTorch or Ultralytics.
 
-    python infer.py --input test/ --weights weights/ --out outputs/
-
-Writes outputs/seg_mask/<stem>.png (uint16 instance IDs), outputs/predictions.json
-(one entry per image with id/class/polygon) and outputs/vis/<stem>.jpg overlays.
+Run: python infer.py --input test/ --weights weights/ --out outputs/ [--runtime]
+Uses the single NCNN export folder in weights/ (model.ncnn.param, model.ncnn.bin, metadata.yaml)
+and the optional weights/inference_config.json (imgsz, conf, roi, max_det).
+Pre- and post-processing reproduce Ultralytics 8.4.215 predict(retina_masks=True): letterbox,
+class-aware NMS at IoU 0.5, and mask logits interpolated from the prototypes at original
+resolution inside each box, so results match infer_ultralytics.py byte for byte.
+Automatic ROI is a conservative light-paper heuristic; use --roi full for other backgrounds.
+Predicted masks keep their largest visible component with holes filled, so each polygon matches
+its seg_mask instance. Changes are reported on stderr. No downloads happen during inference.
 """
+from pathlib import Path
 import argparse
-import ast
 import json
+import math
 import sys
 import time
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import cv2
 import numpy as np
-import onnxruntime as ort
 from PIL import Image, ImageOps
 
-CLASSES = ("black", "broken", "good", "husk", "immature", "parchment", "shell")
-EXTENSIONS = {".jpg", ".jpeg", ".png"}
-CONFIG_NAME = "config.json"
-DEFAULTS = {
-    "model": None,  # ONNX file inside --weights; default best.onnx, else the only *.onnx
-    "class_map": {},  # model class name -> one of CLASSES (names already in CLASSES map to themselves)
-    "conf": 0.25,  # minimum class score
-    "iou": 0.7,  # NMS IoU threshold
-    "agnostic_nms": True,  # one bean gives one instance whatever its class
-    "max_det": 300,
-    "min_area": 20,  # smallest instance kept, in original-image pixels
-    "min_keep": 0.5,  # drop an instance when less than this share of its mask is free of earlier ones
-}
-PAD_VALUE = 114  # Ultralytics letterbox colour
-NMS_CLASS_OFFSET = 7680.0  # Ultralytics max_wh for class-aware NMS
-CLASS_COLORS = {  # RGB, used for vis/ only
-    "black": (35, 35, 35),
-    "broken": (230, 60, 60),
-    "good": (50, 190, 70),
-    "husk": (165, 95, 35),
-    "immature": (245, 205, 30),
-    "parchment": (60, 135, 245),
-    "shell": (200, 70, 220),
-}
+CLASSES = ['black', 'broken', 'good', 'husk', 'immature', 'parchment', 'shell']
+PAD_VALUE = 114     # Ultralytics letterbox grey
+NMS_IOU = 0.5       # Ultralytics 8.4.215 default predict IoU (infer_ultralytics.py does not set iou)
+MAX_WH = 7680       # class offset for class-aware NMS
+MAX_NMS = 30000     # boxes kept before NMS
 
 
-# ----------------------------------------------------------------------------- model
+def warn(message):
+    print('POSTPROCESS:', message, file=sys.stderr)
 
 
-def load_config(folder):
-    config = dict(DEFAULTS)
-    path = folder / CONFIG_NAME
-    if path.is_file():
-        with path.open(encoding="utf-8") as stream:
-            user = json.load(stream)
-        if not isinstance(user, dict):
-            raise ValueError(f"{path} must contain a JSON object")
-        unknown = set(user) - set(DEFAULTS)
-        if unknown:
-            raise ValueError(f"Unknown keys in {path}: {', '.join(sorted(unknown))}")
-        config.update(user)
-
-    if config["model"] is not None and not isinstance(config["model"], str):
-        raise ValueError("config 'model' must be a file name")
-    if not isinstance(config["class_map"], dict):
-        raise ValueError("config 'class_map' must be an object")
-    for key in ("conf", "iou", "min_keep"):
-        if not isinstance(config[key], (int, float)) or not 0 <= config[key] <= 1:
-            raise ValueError(f"config '{key}' must be a number between 0 and 1")
-    for key, low in (("max_det", 1), ("min_area", 3)):
-        if not isinstance(config[key], int) or config[key] < low:
-            raise ValueError(f"config '{key}' must be an integer >= {low}")
-    if not isinstance(config["agnostic_nms"], bool):
-        raise ValueError("config 'agnostic_nms' must be true or false")
-    return config
+def read_rgb(path):
+    with Image.open(path) as image:
+        return np.array(ImageOps.exif_transpose(image).convert('RGB'))
 
 
-def find_model(folder, name):
-    if name:
-        path = folder / name
-        if not path.is_file():
-            raise FileNotFoundError(f"Model named in {CONFIG_NAME} not found: {path}")
-        return path
-    if (folder / "best.onnx").is_file():
-        return folder / "best.onnx"
-    candidates = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".onnx")
-    if not candidates:
-        raise FileNotFoundError(f"No .onnx model found in {folder}")
-    if len(candidates) > 1:
-        raise ValueError(f"Several .onnx models in {folder}. Name one best.onnx or set 'model' in {CONFIG_NAME}.")
-    return candidates[0]
+def roi_box(rgb, mode='auto'):
+    h, w = rgb.shape[:2]
+    full = (0, 0, w, h)
+    if mode == 'full':
+        return full
+    scale = min(1., 1024/max(h, w))
+    small = cv2.resize(rgb, (round(w*scale), round(h*scale)), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+    if np.median(hsv[..., 1]) > 35 or np.median(hsv[..., 2]) < 140:
+        return full
+    fg = (((hsv[..., 1] > 38) & (hsv[..., 2] < 247)) | (hsv[..., 2] < 80)).astype('uint8')
+    n, components, stats, _ = cv2.connectedComponentsWithStats(fg)
+    selected = np.zeros_like(fg)
+    for k, (x, y, bw, bh, area) in enumerate(stats[1:], 1):
+        if area < 12:
+            continue
+        touches = x == 0 or y == 0 or x+bw == fg.shape[1] or y+bh == fg.shape[0]
+        if touches and max(bw/bh, bh/bw) > 8:
+            continue  # narrow dark page edge; never a central-position crop
+        selected[components == k] = 1
+    ys, xs = np.where(selected)
+    if not len(xs):
+        return full
+    pad = max(24, .15*max(xs.max()-xs.min()+1, ys.max()-ys.min()+1)/scale)
+    box = (max(0, int(xs.min()/scale-pad)), max(0, int(ys.min()/scale-pad)),
+           min(w, int((xs.max()+1)/scale+pad)), min(h, int((ys.max()+1)/scale+pad)))
+    return full if (box[2]-box[0])*(box[3]-box[1]) > .85*w*h else box
 
 
-class Segmenter:
-    def __init__(self, weights):
-        if not weights.exists():
-            raise FileNotFoundError(f"Weights not found: {weights}")
-        folder = weights if weights.is_dir() else weights.parent
-        self.cfg = load_config(folder)
-        self.model_path = weights if weights.is_file() else find_model(folder, self.cfg["model"])
+def polygon_mask(raw, occupied, tag='', min_area=16):
+    visible = np.asarray(raw, dtype=bool) & ~occupied
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(visible.astype('uint8'), connectivity=8)
+    if n <= 1:
+        warn(f'{tag}: no visible pixels; discarded')
+        return None
+    k = 1+int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    chosen = (labels == k).astype('uint8')
+    contours, _ = cv2.findContours(chosen, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    contour = max(contours, key=cv2.contourArea)
+    filled = np.zeros_like(chosen)
+    cv2.fillPoly(filled, [contour], 1)
+    if np.any(filled.astype(bool) & occupied):
+        warn(f'{tag}: polygon would overwrite another instance; discarded')
+        return None
+    if filled.sum() < min_area or len(contour) < 3 or cv2.contourArea(contour) < 1:
+        warn(f'{tag}: too small for a polygon; discarded')
+        return None
+    dropped = int(visible.sum()-chosen.sum())
+    added = int(filled.sum()-chosen.sum())
+    if dropped or added:
+        warn(f'{tag}: removed {dropped} disconnected pixels; filled {added} hole pixels')
+    return filled.astype(bool), contour.reshape(-1, 2)
 
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        options.log_severity_level = 3
-        self.session = ort.InferenceSession(
-            str(self.model_path), options, providers=["CPUExecutionProvider"]
-        )
-        meta = self.session.get_modelmeta().custom_metadata_map
-        if meta.get("task", "segment") != "segment":
-            raise ValueError(f"{self.model_path.name} is a '{meta['task']}' model, not a segmentation model")
-        if "names" not in meta:
-            raise ValueError(f"{self.model_path.name} has no class names in its metadata")
-        names = ast.literal_eval(meta["names"])
+
+def output_instances(detections, shape, offset=(0, 0)):
+    """Paint instances by score; each mask covers only its box: detections are (score, class, bx, by, mask)."""
+    result = np.zeros(shape, dtype=np.uint16)
+    objects = []
+    ox, oy = offset
+    scores = np.array([d[0] for d in detections], dtype=np.float32)
+    for index in np.argsort(-scores, kind='stable'):
+        _, cls, bx, by, m = detections[index]
+        x, y = ox+bx, oy+by
+        if y+m.shape[0] > shape[0] or x+m.shape[1] > shape[1]:
+            raise ValueError('Prediction mask extends beyond original image')
+        view = result[y:y+m.shape[0], x:x+m.shape[1]]
+        fixed = polygon_mask(m, view != 0, tag=f'prediction {index}')
+        if fixed is None:
+            continue
+        binary, contour = fixed
+        instance_id = len(objects)+1
+        if instance_id > 65535:
+            raise ValueError('Too many instances for uint16')
+        view[binary] = instance_id
+        objects.append({'id': instance_id, 'class': CLASSES[cls],
+                        'polygon': (contour+np.array([x, y])).astype(int).tolist()})
+    return result, objects
+
+
+def local_ncnn(folder):
+    folder = Path(folder).resolve()
+    if not folder.is_dir():
+        raise FileNotFoundError('--weights must be a local directory')
+    exports = sorted(p for p in folder.iterdir() if p.is_dir() and list(p.glob('*.param')) and list(p.glob('*.bin')))
+    if len(exports) > 1:
+        raise ValueError('More than one NCNN export found; keep one model in weights/')
+    if not exports:
+        raise FileNotFoundError('Expected one exported NCNN model subfolder in weights/')
+    params = [p for p in sorted(exports[0].glob('*.param')) if not p.name.endswith('.pnnx.param')]
+    if len(params) != 1:
+        raise ValueError(f'Expected one .param file in {exports[0]}')
+    return params[0]
+
+
+def read_metadata(path):
+    """Read the flat metadata.yaml that Ultralytics writes (no PyYAML needed): top-level scalars,
+    plus indented `key: value` maps (names) and `- item` lists (imgsz)."""
+    meta, parent = {}, None
+    for line in path.read_text(encoding='utf-8').splitlines():
+        text = line.strip()
+        if not text or text.startswith('#'):
+            continue
+        if line[0] in ' \t' or text.startswith('- '):
+            if parent is None:
+                continue
+            if text.startswith('- '):
+                meta[parent] = (meta[parent] or []) + [text[2:].strip().strip('\'"')]
+            else:
+                key, _, value = text.partition(':')
+                meta[parent] = meta[parent] or {}
+                if isinstance(meta[parent], dict):
+                    key = key.strip().strip('\'"')
+                    meta[parent][int(key) if key.isdigit() else key] = value.strip().strip('\'"')
+            continue
+        key, _, value = text.partition(':')
+        value = value.strip().strip('\'"')
+        meta[key.strip()] = value or None
+        parent = key.strip() if not value else None
+    return meta
+
+
+class NcnnSegmenter:
+    def __init__(self, param):
+        import ncnn
+        self.ncnn = ncnn
+        meta_path = param.parent/'metadata.yaml'
+        if not meta_path.is_file():
+            raise FileNotFoundError(f'Missing metadata.yaml next to {param.name}')
+        meta = read_metadata(meta_path)
+        if meta.get('task', 'segment') != 'segment':
+            raise ValueError('NCNN model is not a segmentation model')
+        names = meta.get('names') or {}
         names = [names[i] for i in range(len(names))] if isinstance(names, dict) else list(names)
+        if names != CLASSES:
+            raise ValueError('Model class names do not match the seven competition classes')
+        self.stride = int(meta.get('stride', 32))
+        self.net = ncnn.Net()
+        self.net.opt.use_vulkan_compute = False  # CPU only; other options are NCNN defaults, as in Ultralytics
+        bin_path = param.with_suffix('.bin')
+        if self.net.load_param(str(param)) != 0 or self.net.load_model(str(bin_path)) != 0:
+            raise ValueError(f'NCNN could not load {param.name} / {bin_path.name}')
+        self.input_name = self.net.input_names()[0]
+        self.output_names = sorted(self.net.output_names())
 
-        class_map = self.cfg["class_map"]
-        self.labels = [class_map.get(name, name) for name in names]
-        unmapped = sorted({n for n, label in zip(names, self.labels) if label not in CLASSES})
-        if unmapped:
-            raise ValueError(
-                f"Model classes {unmapped} are not Day 2 classes. Map them in {folder / CONFIG_NAME} "
-                f"'class_map' to one of {', '.join(CLASSES)}."
-            )
+    def forward(self, blob):
+        """Return detections (4+nc+nm, anchors) and prototypes (nm, mh, mw)."""
+        outputs = []
+        with self.net.create_extractor() as ex:
+            ex.input(self.input_name, self.ncnn.Mat(blob).clone())
+            for name in self.output_names:
+                status, mat = ex.extract(name)
+                if status != 0:
+                    raise RuntimeError(f'NCNN could not compute {name}')
+                outputs.append(np.array(mat))
+        by_rank = {o.ndim: o for o in outputs}
+        if set(by_rank) != {2, 3}:
+            raise ValueError(f'Unexpected NCNN outputs {[o.shape for o in outputs]}')
+        return by_rank[2], by_rank[3]
 
-        inputs, outputs = self.session.get_inputs(), self.session.get_outputs()
-        if len(outputs) != 2:
-            raise ValueError("Expected a YOLO segmentation model with detection and prototype outputs")
-        self.input_name = inputs[0].name
-        h, w = inputs[0].shape[2:4]
-        if not (isinstance(h, int) and isinstance(w, int)):
-            size = ast.literal_eval(meta.get("imgsz", "[640, 640]"))
-            h, w = (size, size) if isinstance(size, int) else size
-        self.input_hw = (int(h), int(w))
+    def predict(self, rgb, imgsz, conf, max_det):
+        """Detections sorted by score: (score, class, x, y, box-local bool mask), like Ultralytics results."""
+        h0, w0 = rgb.shape[:2]
+        # Letterbox (Ultralytics LetterBox, auto=False for NCNN)
+        r = min(imgsz/h0, imgsz/w0)
+        new_w, new_h = max(round(w0*r), 1), max(round(h0*r), 1)
+        image = rgb if (new_w, new_h) == (w0, h0) else cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        dw, dh = (imgsz-new_w)/2, (imgsz-new_h)/2
+        top, left = round(dh-.1), round(dw-.1)
+        image = cv2.copyMakeBorder(image, top, round(dh+.1), left, round(dw+.1),
+                                   cv2.BORDER_CONSTANT, value=(PAD_VALUE,)*3)
+        blob = np.ascontiguousarray(image.transpose(2, 0, 1), dtype=np.float32)/255
 
-    def detect(self, image):
-        """Return [(box_xyxy, class, score, proto_logits)] sorted by score, boxes in image pixels."""
-        h0, w0 = image.shape[:2]
-        blob, gain, (left, top) = letterbox(image, self.input_hw)
-        raw, protos = self.session.run(None, {self.input_name: blob})
-        nc, nm = len(self.labels), protos.shape[1]
-        if raw.ndim != 3 or raw.shape[1] != 4 + nc + nm:
-            raise ValueError(f"Unexpected model output shape {raw.shape}")
-
-        pred = raw[0].T  # (anchors, 4 + nc + nm): cx, cy, w, h, class scores, mask coefficients
-        scores = pred[:, 4 : 4 + nc]
+        raw, protos = self.forward(blob)
+        nc, nm = len(CLASSES), protos.shape[0]
+        if raw.shape[0] != 4+nc+nm:
+            raise ValueError(f'Unexpected detection output shape {raw.shape}')
+        pred = raw.T
+        scores = pred[:, 4:4+nc]
         cls = scores.argmax(1)
-        conf = scores[np.arange(len(pred)), cls]
-        keep = conf > self.cfg["conf"]
-        if not keep.any():
+        score = scores[np.arange(len(pred)), cls]
+        keep = score > conf
+        pred, cls, score = pred[keep], cls[keep], score[keep]
+        if not len(pred):
             return []
-        pred, cls, conf = pred[keep], cls[keep], conf[keep]
-        xy, wh = pred[:, :2], pred[:, 2:4]
-        boxes = np.concatenate((xy - wh / 2, xy + wh / 2), axis=1)
-        order = nms(boxes, conf, self.cfg["iou"], None if self.cfg["agnostic_nms"] else cls)
-        order = order[: self.cfg["max_det"]]
+        if len(pred) > MAX_NMS:
+            top_k = np.argsort(-score, kind='stable')[:MAX_NMS]
+            pred, cls, score = pred[top_k], cls[top_k], score[top_k]
+        boxes = np.concatenate((pred[:, :2]-pred[:, 2:4]/2, pred[:, :2]+pred[:, 2:4]/2), 1)
+        order = nms(boxes+cls[:, None].astype(np.float32)*MAX_WH, score, NMS_IOU)[:max_det]
+        boxes, cls, score, coef = boxes[order], cls[order], score[order], pred[order, 4+nc:]
 
-        boxes = (boxes[order] - (left, top, left, top)) / gain
+        # Boxes back to the original image (ops.scale_boxes + clip_boxes)
+        boxes = (boxes-np.array([left, top, left, top], np.float32))/np.array(
+            [new_w/w0, new_h/h0, new_w/w0, new_h/h0], np.float32)
         boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, w0)
         boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, h0)
-        logits = proto_logits(pred[order, 4 + nc :], protos[0], (h0, w0))
-        return [
-            (boxes[k], self.labels[cls[i]], float(conf[i]), logits[k]) for k, i in enumerate(order)
-        ]
 
-    def segment(self, image):
-        """Return (uint16 label image, objects, notes). Each object's pixels equal its filled polygon."""
-        h0, w0 = image.shape[:2]
-        label = np.zeros((h0, w0), np.uint16)
-        objects = []
-        notes = {"fragment_px": 0, "duplicate": 0, "small": 0, "enclosing": 0}
+        # Masks at original resolution, kept inside each box. Ultralytics picks one of two routes:
+        # a dense stack (ops.process_mask_native) when it is small, else box-local interpolation.
+        _, mh, mw = protos.shape
+        logits = (coef@protos.reshape(nm, -1)).reshape(-1, mh, mw)
+        corners = np.clip(np.ceil(boxes).astype(np.int64), 0, [w0, h0, w0, h0])
+        dense = len(boxes)*h0*w0 <= 1 << 22
+        if dense:
+            gain = min(4*mh/h0, 4*mw/w0)
+            pad = (4*mh-max(round(h0*gain), 1)) | (4*mw-max(round(w0*gain), 1))
+            f = 4//math.gcd(4, pad | pad//2)  # prototype upsample that crops the padding on whole pixels
+            gain = min(f*mh/h0, f*mw/w0)
+            ch, cw = max(round(h0*gain), 1), max(round(w0*gain), 1)
+            ptop, pleft = round((f*mh-ch)/2-.1), round((f*mw-cw)/2-.1)
+        else:
+            gain = min(4*mh/h0, 4*mw/w0)
+            ch, cw = max(round(h0*gain), 1), max(round(w0*gain), 1)
+            ptop, pleft = round((4*mh-ch)/2-.1), round((4*mw-cw)/2-.1)
+            fx = ((np.arange(w0, dtype=np.float32)+.5)*(cw/w0)+pleft).clip(pleft+2, pleft+cw-2)/4-.5
+            fy = ((np.arange(h0, dtype=np.float32)+.5)*(ch/h0)+ptop).clip(ptop+2, ptop+ch-2)/4-.5
+            ix, iy = fx.astype(np.int64), fy.astype(np.int64)
+            fx, fy = fx-ix, fy-iy
+            ix1, iy1 = np.minimum(ix+1, mw-1), np.minimum(iy+1, mh-1)
 
-        for box, name, _, logits in self.detect(image):
-            x0, y0, raw = upsample_mask(logits, box, (h0, w0))
-            raw_area = int(raw.sum())
-            if raw_area == 0:
-                notes["small"] += 1
+        detections = []
+        for k, (x1, y1, x2, y2) in enumerate(corners):
+            if x2 <= x1 or y2 <= y1:
                 continue
-            region = label[y0 : y0 + raw.shape[0], x0 : x0 + raw.shape[1]]  # view into label
-            free = (raw & (region == 0)).astype(np.uint8)  # earlier (higher score) instances keep pixels
-
-            count, components, stats, _ = cv2.connectedComponentsWithStats(free, connectivity=8)
-            if count < 2:
-                notes["duplicate"] += 1
-                continue
-            largest = 1 + int(stats[1:, cv2.CC_STAT_AREA].argmax())
-            part = (components == largest).astype(np.uint8)
-            contours, _ = cv2.findContours(part, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            contour = max(contours, key=len)
-            filled = np.zeros_like(part)
-            cv2.fillPoly(filled, [contour], 1)  # the component with its holes filled
-            filled = filled.astype(bool)
-
-            area = int(filled.sum())
-            if area < self.cfg["min_keep"] * raw_area:
-                notes["duplicate"] += 1
-                continue
-            if area < self.cfg["min_area"] or len(contour) < 3:
-                notes["small"] += 1
-                continue
-            if (filled & (region > 0)).any():
-                # Another instance sits in a hole of this one; one polygon cannot describe a ring.
-                notes["enclosing"] += 1
-                continue
-
-            notes["fragment_px"] += int(free.sum()) - int(stats[largest, cv2.CC_STAT_AREA])
-            object_id = len(objects) + 1
-            if object_id > np.iinfo(np.uint16).max:
-                raise ValueError("Too many instances for a uint16 mask")
-            region[filled] = object_id
-            polygon = (contour[:, 0, :] + (x0, y0)).tolist()
-            objects.append({"id": object_id, "class": name, "polygon": polygon})
-        return label, objects, notes
+            m = logits[k]
+            if dense:  # bilinear (align_corners=False) x f, crop the letterbox span, bilinear to the image
+                if f > 1:
+                    m = cv2.resize(m, (mw*f, mh*f), interpolation=cv2.INTER_LINEAR)
+                if m.shape != (h0, w0):
+                    m = cv2.resize(m[ptop:ptop+ch, pleft:pleft+cw], (w0, h0), interpolation=cv2.INTER_LINEAR)
+                m = m[y1:y2, x1:x2] > 0
+            else:  # sample only the box pixels: columns first, then rows
+                cols, rows = slice(x1, x2), slice(y1, y2)
+                m = m[:, ix[cols]]+(m[:, ix1[cols]]-m[:, ix[cols]])*fx[cols]
+                m = m[iy[rows]]+(m[iy1[rows]]-m[iy[rows]])*fy[rows][:, None] > 0
+            if m.any():  # Ultralytics drops predictions whose mask is empty
+                detections.append((float(score[k]), int(cls[k]), int(x1), int(y1), m))
+        return detections
 
 
-# ----------------------------------------------------------------------------- geometry
-
-
-def letterbox(image, size):
-    """Ultralytics-style letterbox: keep aspect ratio, pad with grey to the model input size."""
-    h0, w0 = image.shape[:2]
-    gain = min(size[0] / h0, size[1] / w0)
-    w, h = round(w0 * gain), round(h0 * gain)
-    if (w, h) != (w0, h0):
-        image = cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR)
-    dw, dh = (size[1] - w) / 2, (size[0] - h) / 2
-    top, bottom = round(dh - 0.1), round(dh + 0.1)
-    left, right = round(dw - 0.1), round(dw + 0.1)
-    image = cv2.copyMakeBorder(
-        image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(PAD_VALUE,) * 3
-    )
-    blob = np.ascontiguousarray(image.transpose(2, 0, 1)[None], dtype=np.float32) / 255.0
-    return blob, gain, (left, top)
-
-
-def nms(boxes, scores, iou_threshold, classes=None):
-    if classes is not None:
-        boxes = boxes + classes[:, None].astype(boxes.dtype) * NMS_CLASS_OFFSET
+def nms(boxes, scores, iou_threshold):
+    """torchvision.ops.nms: keep boxes in score order, suppress IoU > threshold."""
     x1, y1, x2, y2 = boxes.T
-    areas = (x2 - x1) * (y2 - y1)
-    order = np.argsort(-scores, kind="stable")
+    areas = (x2-x1)*(y2-y1)
+    order = np.argsort(-scores, kind='stable')
     keep = []
     while order.size:
         i, rest = order[0], order[1:]
         keep.append(i)
-        w = (np.minimum(x2[i], x2[rest]) - np.maximum(x1[i], x1[rest])).clip(0)
-        h = (np.minimum(y2[i], y2[rest]) - np.maximum(y1[i], y1[rest])).clip(0)
-        inter = w * h
-        union = areas[i] + areas[rest] - inter
+        w = (np.minimum(x2[i], x2[rest])-np.maximum(x1[i], x1[rest])).clip(0)
+        h = (np.minimum(y2[i], y2[rest])-np.maximum(y1[i], y1[rest])).clip(0)
+        inter = w*h
+        union = areas[i]+areas[rest]-inter
         iou = np.divide(inter, union, out=np.zeros_like(inter), where=union > 0)
         order = rest[iou <= iou_threshold]
-    return np.array(keep, dtype=int)
+    return np.array(keep, dtype=np.int64)
 
 
-def proto_logits(coefs, protos, shape):
-    """Mask logits on the prototype grid, cropped to the part that covers the unpadded image."""
-    nm, mh, mw = protos.shape
-    h0, w0 = shape
-    logits = (coefs @ protos.reshape(nm, -1)).reshape(-1, mh, mw)
-    gain = min(mh / h0, mw / w0)
-    pad_w, pad_h = (mw - w0 * gain) / 2, (mh - h0 * gain) / 2
-    top, left = int(round(pad_h - 0.1)), int(round(pad_w - 0.1))
-    bottom, right = mh - int(round(pad_h + 0.1)), mw - int(round(pad_w + 0.1))
-    return logits[:, top:bottom, left:right]
-
-
-def upsample_mask(logits, box, shape):
-    """Bilinear-resize logits to image size (align_corners=False), evaluated inside the box only."""
-    h0, w0 = shape
-    x0, y0 = int(np.ceil(box[0])), int(np.ceil(box[1]))
-    x1, y1 = int(np.ceil(box[2])), int(np.ceil(box[3]))
-    if x1 <= x0 or y1 <= y0:
-        return x0, y0, np.zeros((0, 0), bool)
-    sx, sy = logits.shape[1] / w0, logits.shape[0] / h0
-    matrix = np.array([[sx, 0, (x0 + 0.5) * sx - 0.5], [0, sy, (y0 + 0.5) * sy - 0.5]])
-    patch = cv2.warpAffine(
-        np.ascontiguousarray(logits, dtype=np.float32),
-        matrix,
-        (x1 - x0, y1 - y0),
-        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
-    return x0, y0, patch > 0
-
-
-# ----------------------------------------------------------------------------- I/O
-
-
-def input_images(path):
-    if path.is_file():
-        candidates = [path]
-    elif path.is_dir():
-        candidates = list(path.iterdir())
-    else:
-        raise FileNotFoundError(f"Input not found: {path}")
-
-    images = sorted(
-        (p for p in candidates if p.is_file() and p.suffix.lower() in EXTENSIONS), key=lambda p: p.name
-    )
-    if not images:
-        raise ValueError(f"No jpg, jpeg, or png images found: {path}")
-    if len({p.name.casefold() for p in images}) != len(images) or len(
-        {p.stem.casefold() for p in images}
-    ) != len(images):
-        raise ValueError("Input file names and stems must be unique (img_01.jpg and img_01.png clash).")
-    return images
-
-
-def read_image(path):
-    """RGB uint8 array after applying EXIF orientation."""
-    try:
-        with Image.open(path) as raw:
-            image = ImageOps.exif_transpose(raw).convert("RGB")
-    except Exception as error:
-        raise ValueError(f"Cannot read image: {error}") from error
-    return np.array(image)
-
-
-def check_prediction(label, objects, shape):
-    """Fail loudly if the mask and JSON objects do not follow the Day 2 format."""
-    h0, w0 = shape
-    if label.shape != (h0, w0) or label.dtype != np.uint16:
-        raise ValueError("Mask must be single-channel uint16 with the image size")
-    ids = [obj["id"] for obj in objects]
-    if ids != list(range(1, len(objects) + 1)):
-        raise ValueError("Object ids must be 1..N")
-    areas = np.bincount(label.ravel(), minlength=len(objects) + 1)
-    if len(areas) != len(objects) + 1 or (len(objects) and areas[1:].min() == 0):
-        raise ValueError("Mask instance IDs do not match the objects")
-    for obj in objects:
-        if obj["class"] not in CLASSES:
-            raise ValueError(f"Invalid class {obj['class']!r}")
-        points = np.array(obj["polygon"], dtype=np.int64)
-        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3:
-            raise ValueError(f"Object {obj['id']} needs a polygon of at least 3 [x, y] points")
-        if points.min() < 0 or points[:, 0].max() >= w0 or points[:, 1].max() >= h0:
-            raise ValueError(f"Object {obj['id']} polygon leaves the image")
-        x, y, w, h = cv2.boundingRect(points.astype(np.int32))
-        canvas = np.zeros((h, w), np.uint8)
-        cv2.fillPoly(canvas, [(points - (x, y)).astype(np.int32)], 1)
-        drawn = canvas.astype(bool)
-        if int(drawn.sum()) != int(areas[obj["id"]]) or not (label[y : y + h, x : x + w][drawn] == obj["id"]).all():
-            raise ValueError(f"Object {obj['id']} polygon does not match its mask")
-
-
-def draw_overlay(image, label, objects):
-    vis = image.copy()
-    if not objects:
-        return vis
-    colors = np.zeros((len(objects) + 1, 3), np.float32)
-    for obj in objects:
-        colors[obj["id"]] = CLASS_COLORS[obj["class"]]
-    fg = label > 0
-    vis[fg] = (0.55 * vis[fg] + 0.45 * colors[label[fg]]).astype(np.uint8)
-
-    scale = max(0.35, min(image.shape[:2]) / 1500)
-    for obj in objects:
-        points = np.array(obj["polygon"], np.int32)
-        cv2.polylines(vis, [points], True, (255, 255, 255), 1, cv2.LINE_AA)
-    for obj in objects:
-        x, y = np.array(obj["polygon"]).min(0)
-        org = (int(x), max(int(y) - 3, 10))
-        text = f"{obj['id']}:{obj['class']}"
-        cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 1, cv2.LINE_AA)
-    return vis
-
-
-def save_image(path, array, params=()):
-    ok, data = cv2.imencode(path.suffix, array, list(params))
-    if not ok:
-        raise OSError(f"Could not encode {path.name}")
-    path.write_bytes(data.tobytes())
-
-
-def check_replaceable(output):
-    """Only replace a directory that holds nothing but results of this script."""
-    if not output.is_dir():
-        raise ValueError(f"Output path must be a directory: {output}")
-    for path in output.rglob("*"):
-        rel = path.relative_to(output)
-        if rel != Path("predictions.json") and rel.parts[0] not in ("seg_mask", "vis"):
-            raise ValueError(f"Output contains other files ({rel}). Use a dedicated directory: {output}")
+def run(args):
+    source, destination = Path(args.input).resolve(), Path(args.out).resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(args.input)
+    if source == destination or source in destination.parents:
+        raise ValueError('Keep outputs outside the input folder')
+    files = sorted(p for p in source.iterdir() if p.is_file() and p.suffix.lower() in ('.jpg', '.jpeg', '.png'))
+    if not files:
+        raise ValueError('No supported input images')
+    if len({p.stem.casefold() for p in files}) != len(files):
+        raise ValueError('Duplicate input stems would overwrite output PNGs')
+    param = local_ncnn(args.weights)
+    config_path = Path(args.weights)/'inference_config.json'
+    config = json.loads(config_path.read_text()) if config_path.is_file() else {}
+    imgsz = args.imgsz if args.imgsz is not None else int(config.get('imgsz', 640))
+    conf = args.conf if args.conf is not None else float(config.get('conf', .25))
+    if imgsz <= 0 or not 0 <= conf <= 1:
+        raise ValueError('Invalid imgsz/conf')
+    roi = args.roi if args.roi is not None else config.get('roi', 'auto')
+    max_det = int(config.get('max_det', 500))
+    if roi not in ('auto', 'full') or max_det < 1:
+        raise ValueError('Invalid ROI/max_det config')
+    started = time.perf_counter()
+    model = NcnnSegmenter(param)
+    if imgsz % model.stride:  # Ultralytics check_imgsz rounds up to the stride
+        fixed = math.ceil(imgsz/model.stride)*model.stride
+        print(f'WARNING: imgsz {imgsz} is not a multiple of {model.stride}; using {fixed}', file=sys.stderr)
+        imgsz = fixed
+    if args.runtime:
+        print(f'Setup (import ncnn + load {param.parent.name}): {time.perf_counter()-started:.2f} s')
+    for kind in ['seg_mask']+(['vis'] if args.vis else []):
+        (destination/kind).mkdir(parents=True, exist_ok=True)
+    records = []
+    times = []
+    for index, path in enumerate(files, 1):
+        started = time.perf_counter()
+        rgb = read_rgb(path)
+        x0, y0, x1, y1 = roi_box(rgb, roi)
+        crop = rgb[y0:y1, x0:x1]
+        detections = model.predict(crop, imgsz, conf, max_det)
+        mask, objects = output_instances(detections, rgb.shape[:2], (x0, y0))
+        Image.fromarray(mask).save(destination/'seg_mask'/(path.stem+'.png'))
+        records.append({'image_name': path.name, 'objects': objects})
+        if args.vis:
+            overlay = rgb.copy()
+            for obj in objects:
+                color = np.random.default_rng(obj['id']).integers(40, 240, 3)
+                fg = mask == obj['id']
+                overlay[fg] = (.6*rgb[fg]+.4*color).astype('uint8')
+            Image.fromarray(overlay).save(destination/'vis'/(path.stem+'.jpg'))
+        times.append(time.perf_counter()-started)  # read + ROI + predict + postprocess + save
+        if args.runtime:
+            print(f'[{index}/{len(files)}] {path.name}: {len(objects)} object(s), {times[-1]:.3f} s')
+    (destination/'predictions.json').write_text(json.dumps(records, ensure_ascii=False), encoding='utf-8')
+    if args.runtime:
+        rest = times[1:] or times
+        print(f'Time per image: mean {sum(times)/len(times):.3f} s, max {max(times):.3f} s, '
+              f'total {sum(times):.2f} s for {len(times)} image(s); '
+              f'mean without the first (warm-up) image {sum(rest)/len(rest):.3f} s')
+    print(f'Saved {len(records)} images to {destination}')
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input", type=Path, required=True, help="image file or folder of images")
-    parser.add_argument("--weights", type=Path, required=True, help="folder with the ONNX model (+ config.json)")
-    parser.add_argument("--out", type=Path, required=True, help="output folder")
-    parser.add_argument("--runtime", action="store_true", help="print processing time per image")
+    parser = argparse.ArgumentParser(description=__doc__)
+    for key in ['input', 'weights', 'out']:
+        parser.add_argument('--'+key, required=True)
+    parser.add_argument('--roi', choices=['auto', 'full'], default=None)
+    parser.add_argument('--backend', choices=['auto', 'ncnn'], default='auto', help="NCNN only; kept for compatibility with infer_ultralytics.py")
+    parser.add_argument('--imgsz', type=int, default=None)
+    parser.add_argument('--conf', type=float, default=None)
+    parser.add_argument('--vis', action='store_true', default=True)
+    parser.add_argument('--no-vis', dest='vis', action='store_false')
+    parser.add_argument('--runtime', action='store_true', help='print processing time per image')
     args = parser.parse_args()
-
-    source, output, weights = args.input.resolve(), args.out.resolve(), args.weights.resolve()
-    if source == output or source in output.parents or output in source.parents:
-        raise ValueError("Input and output must be separate.")
-    if weights == output or weights in output.parents or output in weights.parents:
-        raise ValueError("Weights and output must be separate.")
-
-    images = input_images(source)
-    started = time.perf_counter()
-    model = Segmenter(weights)
-    load_time = time.perf_counter() - started
-    loaded = f", loaded in {load_time:.2f} s" if args.runtime else ""
-    print(f"Model: {model.model_path.name}, input {model.input_hw[1]}x{model.input_hw[0]}, {len(images)} image(s){loaded}")
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists():
-        check_replaceable(output)
-
-    # Stage a complete run before replacing results from an earlier run.
-    with TemporaryDirectory(prefix=".day2-", dir=output.parent) as temp:
-        stage = Path(temp) / "new"
-        (stage / "seg_mask").mkdir(parents=True)
-        (stage / "vis").mkdir()
-        predictions = []
-        times = []
-        for index, path in enumerate(images, 1):
-            started = time.perf_counter()
-            try:
-                image = read_image(path)
-                label, objects, notes = model.segment(image)
-                check_prediction(label, objects, image.shape[:2])
-                save_image(stage / "seg_mask" / f"{path.stem}.png", label)
-                vis = cv2.cvtColor(draw_overlay(image, label, objects), cv2.COLOR_RGB2BGR)
-                save_image(stage / "vis" / f"{path.stem}.jpg", vis, (cv2.IMWRITE_JPEG_QUALITY, 90))
-            except Exception as error:
-                raise RuntimeError(f"{path.name}: {error}") from error
-            times.append(time.perf_counter() - started)  # read + inference + post-processing + saving
-            predictions.append({"image_name": path.name, "objects": objects})
-
-            dropped = [f"{v} {k.replace('_', ' ')}" for k, v in notes.items() if v]
-            detail = f" (dropped: {', '.join(dropped)})" if dropped else ""
-            took = f", {times[-1]:.3f} s" if args.runtime else ""
-            print(f"[{index}/{len(images)}] {path.name}: {len(objects)} object(s){took}{detail}")
-
-        with (stage / "predictions.json").open("w", encoding="utf-8") as stream:
-            json.dump(predictions, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
-        if len(list((stage / "seg_mask").glob("*.png"))) != len(images):
-            raise RuntimeError("Mask count does not match the number of input images")
-
-        previous = Path(temp) / "previous"
-        if output.exists():
-            output.rename(previous)
-        try:
-            stage.rename(output)
-        except OSError:
-            if previous.exists():
-                previous.rename(output)
-            raise
-
-    if args.runtime:
-        print(
-            f"Time per image: mean {sum(times) / len(times):.3f} s, max {max(times):.3f} s, "
-            f"total {sum(times):.2f} s for {len(times)} image(s) (+ {load_time:.2f} s model load)"
-        )
-    print(f"Done. Results: {output / 'predictions.json'}, {output / 'seg_mask'}, {output / 'vis'}")
-
-
-if __name__ == "__main__":
     try:
-        main()
+        run(args)
     except Exception as error:
-        print(f"ERROR: {error}", file=sys.stderr)
-        sys.exit(1)
+        print(f'ERROR: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
