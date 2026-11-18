@@ -9,6 +9,7 @@ import argparse
 import ast
 import json
 import sys
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -386,6 +387,7 @@ def main():
     parser.add_argument("--input", type=Path, required=True, help="image file or folder of images")
     parser.add_argument("--weights", type=Path, required=True, help="folder with the ONNX model (+ config.json)")
     parser.add_argument("--out", type=Path, required=True, help="output folder")
+    parser.add_argument("--runtime", action="store_true", help="print processing time per image")
     args = parser.parse_args()
 
     source, output, weights = args.input.resolve(), args.out.resolve(), args.weights.resolve()
@@ -395,8 +397,11 @@ def main():
         raise ValueError("Weights and output must be separate.")
 
     images = input_images(source)
+    started = time.perf_counter()
     model = Segmenter(weights)
-    print(f"Model: {model.model_path.name}, input {model.input_hw[1]}x{model.input_hw[0]}, {len(images)} image(s)")
+    load_time = time.perf_counter() - started
+    loaded = f", loaded in {load_time:.2f} s" if args.runtime else ""
+    print(f"Model: {model.model_path.name}, input {model.input_hw[1]}x{model.input_hw[0]}, {len(images)} image(s){loaded}")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
@@ -408,7 +413,9 @@ def main():
         (stage / "seg_mask").mkdir(parents=True)
         (stage / "vis").mkdir()
         predictions = []
+        times = []
         for index, path in enumerate(images, 1):
+            started = time.perf_counter()
             try:
                 image = read_image(path)
                 label, objects, notes = model.segment(image)
@@ -418,11 +425,13 @@ def main():
                 save_image(stage / "vis" / f"{path.stem}.jpg", vis, (cv2.IMWRITE_JPEG_QUALITY, 90))
             except Exception as error:
                 raise RuntimeError(f"{path.name}: {error}") from error
+            times.append(time.perf_counter() - started)  # read + inference + post-processing + saving
             predictions.append({"image_name": path.name, "objects": objects})
 
             dropped = [f"{v} {k.replace('_', ' ')}" for k, v in notes.items() if v]
             detail = f" (dropped: {', '.join(dropped)})" if dropped else ""
-            print(f"[{index}/{len(images)}] {path.name}: {len(objects)} object(s){detail}")
+            took = f", {times[-1]:.3f} s" if args.runtime else ""
+            print(f"[{index}/{len(images)}] {path.name}: {len(objects)} object(s){took}{detail}")
 
         with (stage / "predictions.json").open("w", encoding="utf-8") as stream:
             json.dump(predictions, stream, ensure_ascii=False, indent=2)
@@ -440,6 +449,11 @@ def main():
                 previous.rename(output)
             raise
 
+    if args.runtime:
+        print(
+            f"Time per image: mean {sum(times) / len(times):.3f} s, max {max(times):.3f} s, "
+            f"total {sum(times):.2f} s for {len(times)} image(s) (+ {load_time:.2f} s model load)"
+        )
     print(f"Done. Results: {output / 'predictions.json'}, {output / 'seg_mask'}, {output / 'vis'}")
 
 
