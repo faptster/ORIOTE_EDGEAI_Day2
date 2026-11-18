@@ -1,0 +1,23 @@
+{
+  "model": "best.onnx",
+  "conf": 0.25,
+  "iou": 0.7,
+  "agnostic_nms": true,
+  "max_det": 300,
+  "min_area": 20,
+  "min_keep": 0.5,
+  "class_map": {
+    "agrio": "black",
+    "broca": "broken",
+    "caracolillo": "good",
+    "concha": "shell",
+    "elefante": "good",
+    "helado": "immature",
+    "negro": "black",
+    "normal": "good",
+    "oreja": "shell",
+    "partido": "broken",
+    "seca": "husk",
+    "triangulo": "good"
+  }
+}
