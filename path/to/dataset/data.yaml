@@ -1,0 +1,11 @@
+path: .
+train: images/train
+val: images/val
+names:
+  0: black
+  1: broken
+  2: good
+  3: husk
+  4: immature
+  5: parchment
+  6: shell
